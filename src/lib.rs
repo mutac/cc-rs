@@ -102,6 +102,7 @@ pub struct Build {
     cpp_link_stdlib: Option<Option<String>>,
     cpp_set_stdlib: Option<String>,
     cuda: bool,
+    program: bool,
     target: Option<String>,
     host: Option<String>,
     out_dir: Option<PathBuf>,
@@ -310,6 +311,7 @@ impl Build {
             cpp_link_stdlib: None,
             cpp_set_stdlib: None,
             cuda: false,
+            program: false,
             target: None,
             host: None,
             out_dir: None,
@@ -557,6 +559,12 @@ impl Build {
         if cuda {
             self.cpp = true;
         }
+        self
+    }
+
+    ///
+    pub fn program(&mut self, program: bool) -> &mut Build {
+        self.program = program;
         self
     }
 
@@ -862,16 +870,19 @@ impl Build {
     ///
     /// This will return a result instead of panicing; see compile() for the complete description.
     pub fn try_compile(&self, output: &str) -> Result<(), Error> {
-        let (lib_name, gnu_lib_name) = if output.starts_with("lib") && output.ends_with(".a") {
+        let (artifact_name, gnu_artifact_name) = if output.starts_with("lib") && output.ends_with(".a") {
             (&output[3..output.len() - 2], output.to_owned())
-        } else {
+        } else if !self.program {
             let mut gnu = String::with_capacity(5 + output.len());
             gnu.push_str("lib");
             gnu.push_str(&output);
             gnu.push_str(".a");
             (output, gnu)
+        } else {
+            (output, output.to_owned())
         };
         let dst = self.get_out_dir()?;
+        println!("{}", dst.to_string_lossy());
 
         let mut objects = Vec::new();
         for file in self.files.iter() {
@@ -897,7 +908,12 @@ impl Build {
             objects.push(Object::new(file.to_path_buf(), obj));
         }
         self.compile_objects(&objects)?;
-        self.assemble(lib_name, &dst.join(gnu_lib_name), &objects)?;
+
+        if self.program {
+            self.link_program(&dst.join(gnu_artifact_name), &objects)?;
+        } else {
+            self.assemble_library(artifact_name, &dst.join(gnu_artifact_name), &objects)?;
+        }
 
         if self.get_target()?.contains("msvc") {
             let compiler = self.get_base_compiler()?;
@@ -920,7 +936,7 @@ impl Build {
             }
         }
 
-        self.print(&format!("cargo:rustc-link-lib=static={}", lib_name));
+        self.print(&format!("cargo:rustc-link-lib=static={}", artifact_name));
         self.print(&format!("cargo:rustc-link-search=native={}", dst.display()));
 
         // Add specific C++ libraries, if enabled.
@@ -1447,7 +1463,7 @@ impl Build {
         Ok((cmd, tool.to_string()))
     }
 
-    fn assemble(&self, lib_name: &str, dst: &Path, objs: &[Object]) -> Result<(), Error> {
+    fn assemble_library(&self, lib_name: &str, dst: &Path, objs: &[Object]) -> Result<(), Error> {
         // Delete the destination if it exists as the `ar` tool at least on Unix
         // appends to it, which we don't want.
         let _ = fs::remove_file(&dst);
@@ -1531,6 +1547,34 @@ impl Build {
                 &cmd,
             )?;
         }
+
+        Ok(())
+    }
+
+    fn link_program(&self, dst: &Path, objs: &[Object]) -> Result<(), Error> {
+        let _ = fs::remove_file(&dst);
+
+        let objects: Vec<_> = objs.iter().map(|obj| obj.dst.clone()).collect();
+        let target = self.get_target()?;
+
+        assert!(!target.contains("msvc"));
+
+        let compiler = self.try_get_compiler()?;
+        let mut cmd = compiler.to_command();
+        for &(ref a, ref b) in self.env.iter() {
+            cmd.env(a, b);
+        }
+        let name = compiler
+            .path
+            .file_name()
+            .ok_or_else(|| Error::new(ErrorKind::IOError, "Failed to get compiler path."))?
+            .to_string_lossy()
+            .into_owned();
+
+        run(
+            cmd.arg("-o").arg(dst).args(&objects).args(&self.objects),
+            &name,
+        )?;
 
         Ok(())
     }
